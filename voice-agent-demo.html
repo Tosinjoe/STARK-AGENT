@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOX — Voice Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  /* ============ CONFIG YOU'LL WANT TO EDIT ============
+     AGENT_NAME  — shown top-left
+     WEBHOOK_URL — your n8n webhook. It should accept POST { query: "<transcript>" }
+                   and return JSON { reply: "<text to speak>" }
+     ==================================================== */
+  :root{
+    --bg-0:#07060b;
+    --bg-1:#0d0b16;
+    --violet:#8b7bff;
+    --cyan:#5eead4;
+    --ember:#ff6b6b;
+    --ink:#e9e6f5;
+    --ink-dim:#8d87a8;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+    --display: "Space Grotesk", system-ui, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    height:100%;margin:0;
+    background:radial-gradient(120% 90% at 50% 15%, var(--bg-1), var(--bg-0) 60%);
+    color:var(--ink);
+    font-family:var(--display);
+    overflow:hidden;
+  }
+  body{
+    display:flex;flex-direction:column;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  header{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:20px 24px 0;
+    font-family:var(--mono);
+    font-size:12px;letter-spacing:.04em;
+    color:var(--ink-dim);
+  }
+  header .dot{
+    width:7px;height:7px;border-radius:50%;
+    background:var(--ink-dim);display:inline-block;margin-right:8px;
+    transition:background .3s, box-shadow .3s;
+  }
+  header .status.live .dot{background:var(--cyan);box-shadow:0 0 8px var(--cyan);}
+  header .status.err .dot{background:var(--ember);box-shadow:0 0 8px var(--ember);}
+
+  main{
+    flex:1;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;
+    gap:36px;padding:0 24px;position:relative;
+  }
+
+  .stage{width:min(280px,60vw);aspect-ratio:1;position:relative;display:grid;place-items:center;}
+  .ring{
+    position:absolute;inset:0;border-radius:50%;
+    border:1px solid rgba(139,123,255,.25);
+  }
+  .ring.r2{inset:14%;border-color:rgba(94,234,212,.18);}
+  .orb{
+    width:46%;aspect-ratio:1;border-radius:50%;
+    background:
+      radial-gradient(circle at 35% 30%, rgba(255,255,255,.55), transparent 45%),
+      radial-gradient(circle at 60% 65%, var(--cyan), var(--violet) 55%, #241b40 85%);
+    box-shadow:0 0 var(--glow-blur,40px) var(--glow-spread,6px) rgba(139,123,255, var(--glow-op,.35));
+    transform: scale(var(--scale, 1));
+    will-change: transform, box-shadow;
+  }
+  .stage.thinking .orb{ animation: think 1.6s linear infinite; }
+  .stage.listening .ring{ animation: spin 6s linear infinite; }
+  @keyframes think{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(360deg)}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  .mic{
+    width:76px;height:76px;border-radius:50%;
+    border:none;cursor:pointer;
+    background:var(--violet);
+    color:#0b0716;
+    display:grid;place-items:center;
+    box-shadow:0 6px 24px rgba(139,123,255,.4);
+    transition:transform .15s, background .3s, box-shadow .3s;
+  }
+  .mic:active{transform:scale(.94);}
+  .mic.on{background:var(--ember);box-shadow:0 0 0 0 rgba(255,107,107,.5);animation:ripple 1.4s ease-out infinite;}
+  @keyframes ripple{0%{box-shadow:0 0 0 0 rgba(255,107,107,.45)}100%{box-shadow:0 0 0 22px rgba(255,107,107,0)}}
+  .mic svg{width:28px;height:28px;}
+
+  .hint{font-family:var(--mono);font-size:12px;color:var(--ink-dim);}
+
+  .caption{
+    position:absolute;bottom:0;left:0;right:0;
+    padding:20px 24px calc(28px + env(safe-area-inset-bottom,0px));
+    background:linear-gradient(to top, var(--bg-0) 40%, transparent);
+    text-align:center;
+  }
+  .caption .line{
+    font-size:15px;line-height:1.5;max-width:640px;margin:0 auto;
+    min-height:1.5em;
+  }
+  .caption .who{
+    font-family:var(--mono);font-size:11px;color:var(--ink-dim);
+    letter-spacing:.04em;margin-bottom:6px;
+  }
+  .caption .you{color:var(--cyan);}
+  .caption .agent{color:var(--ink);}
+  .caption .word{color:var(--ink-dim);transition:color .12s;}
+  .caption .word.active{color:var(--cyan);}
+
+  .unsupported{
+    position:absolute;inset:0;display:none;place-items:center;
+    background:var(--bg-0);text-align:center;padding:40px;
+  }
+  .unsupported.show{display:grid;}
+  .unsupported p{color:var(--ink-dim);font-size:14px;max-width:360px;margin:8px auto 0;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">idle</span></div>
+  <div id="agentName">VOX</div>
+</header>
+
+<main>
+  <div class="stage" id="stage">
+    <div class="ring"></div>
+    <div class="ring r2"></div>
+    <div class="orb"></div>
+  </div>
+  <button class="mic" id="micBtn" aria-label="Start talking">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v1a7 7 0 0 1-14 0v-1"/>
+      <line x1="12" y1="18" x2="12" y2="22"/>
+    </svg>
+  </button>
+  <div class="hint" id="hint">tap to talk</div>
+</main>
+
+<div class="caption">
+  <div class="who" id="captionWho">&nbsp;</div>
+  <div class="line" id="captionLine">Ask me anything — I'll look it up.</div>
+</div>
+
+<div class="unsupported" id="unsupported">
+  <div>
+    <div style="font-size:14px;color:var(--ink)">This browser can't hear you</div>
+    <p>Voice input needs Chrome, Edge, or another Chromium-based browser. Try opening this page there instead.</p>
+  </div>
+</div>
+
+<script>
+(function(){
+  // ---- EDIT THESE ----
+  const AGENT_NAME = "VOX";
+  const WEBHOOK_URL = "https://YOUR-N8N-INSTANCE/webhook/vox"; // POST {query} -> {reply}
+  // ---------------------
+
+  document.getElementById('agentName').textContent = AGENT_NAME;
+
+  const stage = document.getElementById('stage');
+  const micBtn = document.getElementById('micBtn');
+  const hint = document.getElementById('hint');
+  const statusEl = document.getElementById('status');
+  const statusText = document.getElementById('statusText');
+  const capWho = document.getElementById('captionWho');
+  const capLine = document.getElementById('captionLine');
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR){
+    document.getElementById('unsupported').classList.add('show');
+    return;
+  }
+
+  const recognition = new SR();
+  recognition.lang = 'en-US';
+  recognition.interimResults = true;
+  recognition.continuous = false;
+
+  let listening = false;
+
+  // ---------- Orb reactivity engine ----------
+  // `level` is the orb's current energy (0-1), eased toward `targetLevel` every frame.
+  // Listening: targetLevel is set from real mic volume (Web Audio analyser).
+  // Speaking: targetLevel spikes on each spoken word, then decays until the next one.
+  const orbEl = document.querySelector('.orb');
+  let level = 0, targetLevel = 0;
+  let audioCtx = null, analyser = null, micSource = null, freqData = null;
+
+  function renderOrb(t){
+    level += (targetLevel - level) * 0.25;
+    targetLevel *= 0.90; // natural decay so spikes/volume don't stick
+    const idle = Math.sin(t / 900) * 0.02; // gentle breathing at rest
+    const s = 1 + idle + level * 0.5;
+    orbEl.style.setProperty('--scale', s.toFixed(3));
+    orbEl.style.setProperty('--glow-blur', (40 + level * 90).toFixed(0) + 'px');
+    orbEl.style.setProperty('--glow-spread', (6 + level * 20).toFixed(0) + 'px');
+    orbEl.style.setProperty('--glow-op', (0.32 + level * 0.5).toFixed(2));
+
+    if(analyser && listening){
+      analyser.getByteTimeDomainData(freqData);
+      let sum = 0;
+      for(let i=0;i<freqData.length;i++){ const v = (freqData[i]-128)/128; sum += v*v; }
+      const rms = Math.sqrt(sum / freqData.length);
+      targetLevel = Math.max(targetLevel, Math.min(1, rms * 5)); // mic volume drives the orb live
+    }
+    requestAnimationFrame(renderOrb);
+  }
+  requestAnimationFrame(renderOrb);
+
+  function bumpOrb(amount){ targetLevel = Math.max(targetLevel, amount); }
+
+  async function startMicVisualizer(){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      micSource = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      micSource.connect(analyser); // analysis only — not connected to output, so no feedback/echo
+      startMicVisualizer._stream = stream;
+    }catch(e){ /* mic visualizer is a bonus — voice input still works via SpeechRecognition without it */ }
+  }
+
+  function stopMicVisualizer(){
+    if(startMicVisualizer._stream) startMicVisualizer._stream.getTracks().forEach(t => t.stop());
+    if(audioCtx) audioCtx.close();
+    audioCtx = null; analyser = null; micSource = null;
+  }
+  // ---------------------------------------------
+
+  function setStatus(mode){
+    statusEl.className = 'status' + (mode==='live' ? ' live' : mode==='err' ? ' err' : '');
+    statusText.textContent = mode;
+  }
+
+  function setStage(mode){
+    stage.className = 'stage' + (mode ? ' '+mode : '');
+  }
+
+  micBtn.addEventListener('click', () => {
+    if(listening){ recognition.stop(); return; }
+    try{
+      recognition.start();
+    }catch(e){ /* already running */ }
+  });
+
+  recognition.onstart = () => {
+    listening = true;
+    micBtn.classList.add('on');
+    hint.textContent = 'listening…';
+    setStage('listening');
+    setStatus('live');
+    capWho.textContent = 'you';
+    capLine.textContent = '';
+    startMicVisualizer();
+  };
+
+  recognition.onresult = (event) => {
+    let transcript = '';
+    for(let i=0; i<event.results.length; i++){
+      transcript += event.results[i][0].transcript;
+    }
+    capLine.textContent = transcript;
+    if(event.results[event.results.length-1].isFinal){
+      askAgent(transcript);
+    }
+  };
+
+  recognition.onerror = () => {
+    setStatus('err');
+    hint.textContent = 'didn\u2019t catch that — tap to retry';
+  };
+
+  recognition.onend = () => {
+    listening = false;
+    micBtn.classList.remove('on');
+    if(stage.classList.contains('listening')) setStage('');
+    stopMicVisualizer();
+  };
+
+  async function askAgent(query){
+    setStage('thinking');
+    hint.textContent = 'thinking…';
+    capWho.textContent = 'you';
+
+    try{
+      const res = await fetch(WEBHOOK_URL, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ query })
+      });
+      const data = await res.json();
+      speak(data.reply || "I didn't get a usable reply from the backend.");
+    }catch(err){
+      speak("I can't reach my backend yet — set WEBHOOK_URL in the code to your n8n webhook.");
+      setStatus('err');
+    }
+  }
+
+  function speak(text){
+    setStage('');
+    capWho.textContent = AGENT_NAME.toLowerCase();
+    hint.textContent = 'tap to talk';
+    setStatus('idle');
+
+    // Build the caption as individual word spans so we can light each one up
+    // in sync with speech, instead of dumping the whole sentence at once.
+    const words = text.split(/(\s+)/); // keep spaces as their own tokens
+    capLine.innerHTML = words.map(w => w.trim()
+      ? `<span class="word">${w}</span>`
+      : w
+    ).join('');
+
+    if('speechSynthesis' in window){
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.02;
+
+      // Track which char-index range belongs to which rendered word span,
+      // so onboundary (fires per word in Chrome/Edge) can highlight it live.
+      const spans = [];
+      { let pos = 0;
+        words.forEach(w => {
+          if(w.trim()) spans.push({start: pos, end: pos + w.length});
+          pos += w.length;
+        });
+      }
+      const wordEls = capLine.querySelectorAll('.word');
+
+      u.onboundary = (e) => {
+        if(e.name && e.name !== 'word') return; // some voices only fire 'sentence'
+        let idx = spans.findIndex(s => e.charIndex >= s.start && e.charIndex < s.end);
+        if(idx === -1){
+          for(let i=spans.length-1;i>=0;i--){ if(spans[i].start <= e.charIndex){ idx = i; break; } }
+        }
+        wordEls.forEach(el => el.classList.remove('active'));
+        if(idx >= 0 && wordEls[idx]) wordEls[idx].classList.add('active');
+        bumpOrb(1); // orb pulses on every word it speaks
+      };
+
+      u.onend = () => wordEls.forEach(el => el.classList.remove('active'));
+
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    }
+  }
+})();
+</script>
+</body>
+</html>
