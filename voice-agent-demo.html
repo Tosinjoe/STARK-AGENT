@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VOX — Voice Agent</title>
+<title>STARK — Voice Agent</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 <style>
@@ -74,6 +74,7 @@
   }
   .stage.thinking .orb{ animation: think 1.6s linear infinite; }
   .stage.listening .ring{ animation: spin 6s linear infinite; }
+  .stage.speaking .ring{ animation: spin 10s linear infinite reverse; }
   @keyframes think{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(360deg)}}
   @keyframes spin{to{transform:rotate(360deg)}}
 
@@ -101,7 +102,7 @@
   }
   .caption .line{
     font-size:15px;line-height:1.5;max-width:640px;margin:0 auto;
-    min-height:1.5em;
+    min-height:1.5em;max-height:4.5em;overflow-y:auto;
   }
   .caption .who{
     font-family:var(--mono);font-size:11px;color:var(--ink-dim);
@@ -133,14 +134,14 @@
     <div class="ring r2"></div>
     <div class="orb"></div>
   </div>
-  <button class="mic" id="micBtn" aria-label="Start talking">
+  <button class="mic" id="micBtn" aria-label="Go live">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
       <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
       <path d="M19 10v1a7 7 0 0 1-14 0v-1"/>
       <line x1="12" y1="18" x2="12" y2="22"/>
     </svg>
   </button>
-  <div class="hint" id="hint">tap to talk</div>
+  <div class="hint" id="hint">tap to go live</div>
 </main>
 
 <div class="caption">
@@ -158,8 +159,8 @@
 <script>
 (function(){
   // ---- EDIT THESE ----
-  const AGENT_NAME = "VOX";
-  const WEBHOOK_URL = "https://YOUR-N8N-INSTANCE/webhook/vox"; // POST {query} -> {reply}
+  const AGENT_NAME = "STARK";
+  const WEBHOOK_URL = "https://starkagent.app.n8n.cloud/webhook/stark";
   // ---------------------
 
   document.getElementById('agentName').textContent = AGENT_NAME;
@@ -181,9 +182,15 @@
   const recognition = new SR();
   recognition.lang = 'en-US';
   recognition.interimResults = true;
-  recognition.continuous = false;
+  recognition.continuous = false; // continuous mode is unreliable on mobile Chrome — this is safer across devices
 
+  const SILENCE_MS = 550; // how long to wait after you stop talking before sending, if the browser itself doesn't flag the end
+  let turnStartIndex = 0; // where in recognition's result list the CURRENT turn begins
+  let silenceTimer = null;
   let listening = false;
+  let sessionActive = false; // true once the user has gone "live" — stays true across turns
+  let isSpeaking = false;    // true while STARK's own voice is playing, so we don't listen to ourselves
+  let busy = false;          // true while waiting on the backend reply
 
   // ---------- Orb reactivity engine ----------
   // `level` is the orb's current energy (0-1), eased toward `targetLevel` every frame.
@@ -217,6 +224,7 @@
   function bumpOrb(amount){ targetLevel = Math.max(targetLevel, amount); }
 
   async function startMicVisualizer(){
+    if(startMicVisualizer._stream) return; // already open for this session — reuse it, no new permission prompt
     try{
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -231,6 +239,7 @@
 
   function stopMicVisualizer(){
     if(startMicVisualizer._stream) startMicVisualizer._stream.getTracks().forEach(t => t.stop());
+    startMicVisualizer._stream = null;
     if(audioCtx) audioCtx.close();
     audioCtx = null; analyser = null; micSource = null;
   }
@@ -246,15 +255,34 @@
   }
 
   micBtn.addEventListener('click', () => {
-    if(listening){ recognition.stop(); return; }
-    try{
-      recognition.start();
-    }catch(e){ /* already running */ }
+    if(sessionActive){
+      // Ending the live session entirely
+      sessionActive = false;
+      busy = false;
+      isSpeaking = false;
+      clearTimeout(silenceTimer);
+      micBtn.classList.remove('on');
+      hint.textContent = 'tap to go live';
+      setStatus('idle');
+      setStage('');
+      speechSynthesis.cancel();
+      try{ recognition.stop(); }catch(e){}
+      stopMicVisualizer();
+    } else {
+      // Going live — stays on and listens across as many turns as you want
+      sessionActive = true;
+      micBtn.classList.add('on');
+      hint.textContent = 'live — just talk';
+      startMicVisualizer(); // one permission prompt, then the stream stays open
+      // Unlock speech playback inside this tap so the first reply isn't delayed or blocked
+      try{ speechSynthesis.speak(new SpeechSynthesisUtterance('')); }catch(e){}
+      try{ recognition.start(); }catch(e){ /* already running */ }
+    }
   });
 
   recognition.onstart = () => {
     listening = true;
-    micBtn.classList.add('on');
+    turnStartIndex = 0;
     hint.textContent = 'listening…';
     setStage('listening');
     setStatus('live');
@@ -264,55 +292,113 @@
   };
 
   recognition.onresult = (event) => {
+    if(busy || isSpeaking) return;
     let transcript = '';
-    for(let i=0; i<event.results.length; i++){
+    let sawFinal = false;
+    for(let i = turnStartIndex; i < event.results.length; i++){
       transcript += event.results[i][0].transcript;
+      if(event.results[i].isFinal) sawFinal = true;
     }
+    transcript = transcript.trim();
+    capWho.textContent = 'you';
     capLine.textContent = transcript;
-    if(event.results[event.results.length-1].isFinal){
+
+    clearTimeout(silenceTimer);
+    if(sawFinal && transcript){
+      // Browser already detected the end of your turn — send immediately, no extra wait
+      turnStartIndex = event.results.length;
       askAgent(transcript);
+    } else if(transcript){
+      // Still mid-sentence — arm a short fallback in case the browser never flags "final"
+      silenceTimer = setTimeout(() => {
+        turnStartIndex = event.results.length;
+        askAgent(transcript);
+      }, SILENCE_MS);
     }
   };
 
-  recognition.onerror = () => {
+  recognition.onerror = (e) => {
+    console.warn('speech recognition error:', e.error);
+    if(e.error === 'no-speech' || e.error === 'aborted'){
+      return; // normal during hands-free pauses — onend will restart listening automatically
+    }
     setStatus('err');
-    hint.textContent = 'didn\u2019t catch that — tap to retry';
+    const reasons = {
+      'not-allowed': 'mic permission denied — check your browser site settings',
+      'service-not-allowed': 'mic permission denied — check your browser site settings',
+      'network': 'no connection — speech recognition needs internet access',
+      'audio-capture': 'no microphone found on this device'
+    };
+    hint.textContent = reasons[e.error] || ('mic error: ' + e.error + ' — tap to retry');
+    sessionActive = false;
+    busy = false;
+    micBtn.classList.remove('on');
+    stopMicVisualizer();
   };
 
   recognition.onend = () => {
     listening = false;
-    micBtn.classList.remove('on');
     if(stage.classList.contains('listening')) setStage('');
-    stopMicVisualizer();
+    if(sessionActive && !isSpeaking && !busy){
+      setTimeout(() => { try{ recognition.start(); }catch(e){} }, 80);
+    }
   };
 
   async function askAgent(query){
+    busy = true;
     setStage('thinking');
     hint.textContent = 'thinking…';
-    capWho.textContent = 'you';
+    capWho.textContent = AGENT_NAME.toLowerCase();
+    capLine.textContent = '…';
 
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25000);
     try{
       const res = await fetch(WEBHOOK_URL, {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ query })
+        body: JSON.stringify({ query }),
+        signal: ctrl.signal
       });
       const data = await res.json();
+      clearTimeout(timer);
       speak(data.reply || "I didn't get a usable reply from the backend.");
     }catch(err){
-      speak("I can't reach my backend yet — set WEBHOOK_URL in the code to your n8n webhook.");
+      clearTimeout(timer);
       setStatus('err');
+      speak(err.name === 'AbortError'
+        ? "That took too long. Abeg, ask me again."
+        : "I can't reach my backend right now. Check the webhook and that the workflow is active.");
     }
   }
 
+  // Prefer a local English voice (Nigerian if the device has one): network voices add a noticeable start delay
+  let cachedVoice = null;
+  function pickVoice(){
+    if(cachedVoice) return cachedVoice;
+    const voices = speechSynthesis.getVoices();
+    if(!voices.length) return null;
+    cachedVoice =
+      voices.find(v => v.lang === 'en-NG') ||
+      voices.find(v => v.lang.startsWith('en') && v.localService) ||
+      voices.find(v => v.lang.startsWith('en')) || null;
+    return cachedVoice;
+  }
+  if('speechSynthesis' in window){
+    speechSynthesis.onvoiceschanged = () => { cachedVoice = null; pickVoice(); };
+    pickVoice();
+  }
+
   function speak(text){
-    setStage('');
+    busy = false;
+    isSpeaking = true;
+    clearTimeout(silenceTimer);
+    try{ recognition.stop(); }catch(e){} // stop listening while STARK talks, so it doesn't hear itself
+    setStage('speaking');
     capWho.textContent = AGENT_NAME.toLowerCase();
-    hint.textContent = 'tap to talk';
+    hint.textContent = 'speaking…';
     setStatus('idle');
 
-    // Build the caption as individual word spans so we can light each one up
-    // in sync with speech, instead of dumping the whole sentence at once.
     const words = text.split(/(\s+)/); // keep spaces as their own tokens
     capLine.innerHTML = words.map(w => w.trim()
       ? `<span class="word">${w}</span>`
@@ -321,10 +407,10 @@
 
     if('speechSynthesis' in window){
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.02;
+      u.rate = 1.05;
+      const v = pickVoice();
+      if(v){ u.voice = v; u.lang = v.lang; }
 
-      // Track which char-index range belongs to which rendered word span,
-      // so onboundary (fires per word in Chrome/Edge) can highlight it live.
       const spans = [];
       { let pos = 0;
         words.forEach(w => {
@@ -334,21 +420,60 @@
       }
       const wordEls = capLine.querySelectorAll('.word');
 
+      let gotBoundary = false;
+      let fallbackTimers = [];
+      const clearFallback = () => { fallbackTimers.forEach(clearTimeout); fallbackTimers = []; };
+      const highlight = (i) => {
+        wordEls.forEach(el => el.classList.remove('active'));
+        if(wordEls[i]) wordEls[i].classList.add('active');
+        bumpOrb(1);
+      };
+
+      // Real word timing from the browser, when the voice supports it
       u.onboundary = (e) => {
-        if(e.name && e.name !== 'word') return; // some voices only fire 'sentence'
+        if(e.name && e.name !== 'word') return;
+        gotBoundary = true;
+        clearFallback();
         let idx = spans.findIndex(s => e.charIndex >= s.start && e.charIndex < s.end);
         if(idx === -1){
           for(let i=spans.length-1;i>=0;i--){ if(spans[i].start <= e.charIndex){ idx = i; break; } }
         }
-        wordEls.forEach(el => el.classList.remove('active'));
-        if(idx >= 0 && wordEls[idx]) wordEls[idx].classList.add('active');
-        bumpOrb(1); // orb pulses on every word it speaks
+        if(idx >= 0) highlight(idx);
       };
 
-      u.onend = () => wordEls.forEach(el => el.classList.remove('active'));
+      // Fallback: many voices never send word timing, so estimate it from word length
+      u.onstart = () => {
+        fallbackTimers.push(setTimeout(() => {
+          if(gotBoundary) return;
+          let t = 0;
+          spans.forEach((s, i) => {
+            fallbackTimers.push(setTimeout(() => highlight(i), t));
+            const word = text.slice(s.start, s.end);
+            let dur = (s.end - s.start) * 62 + 90;
+            if(/[,;]$/.test(word)) dur += 150;      // short breath after a comma
+            if(/[.!?]$/.test(word)) dur += 320;      // longer pause at sentence end
+            t += dur / u.rate;
+          });
+        }, 250));
+      };
+
+      u.onend = () => {
+        clearFallback();
+        wordEls.forEach(el => el.classList.remove('active'));
+        isSpeaking = false;
+        if(sessionActive){
+          hint.textContent = 'listening…';
+          setTimeout(() => { try{ recognition.start(); }catch(e){} }, 80);
+        } else {
+          hint.textContent = 'tap to go live';
+          setStage('');
+        }
+      };
 
       speechSynthesis.cancel();
       speechSynthesis.speak(u);
+    } else {
+      isSpeaking = false;
     }
   }
 })();
